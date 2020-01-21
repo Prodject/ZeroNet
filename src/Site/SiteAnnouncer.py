@@ -5,6 +5,8 @@ import urllib
 import urllib2
 import struct
 import socket
+import re
+import collections
 
 from lib import bencode
 from lib.subtl.subtl import UdpTrackerClient
@@ -14,12 +16,15 @@ import gevent
 
 from Plugin import PluginManager
 from Config import config
-import util
 from Debug import Debug
+from util import helper
+import util
 
 
 class AnnounceError(Exception):
     pass
+
+global_stats = collections.defaultdict(lambda: collections.defaultdict(int))
 
 
 @PluginManager.acceptPlugins
@@ -32,13 +37,19 @@ class SiteAnnouncer(object):
         self.last_tracker_id = random.randint(0, 10)
         self.time_last_announce = 0
 
+    def getTrackers(self):
+        return config.trackers
+
     def getSupportedTrackers(self):
-        trackers = config.trackers
+        trackers = self.getTrackers()
         if config.disable_udp or config.trackers_proxy != "disable":
             trackers = [tracker for tracker in trackers if not tracker.startswith("udp://")]
 
         if not self.site.connection_server.tor_manager.enabled:
             trackers = [tracker for tracker in trackers if ".onion" not in tracker]
+
+        if "ipv6" not in self.site.connection_server.supported_ip_types:
+            trackers = [tracker for tracker in trackers if helper.getIpType(self.getAddressParts(tracker)["ip"]) != "ipv6"]
 
         return trackers
 
@@ -57,15 +68,17 @@ class SiteAnnouncer(object):
     def getOpenedServiceTypes(self):
         back = []
         # Type of addresses they can reach me
-        if self.site.connection_server.port_opened and config.trackers_proxy == "disable":
-            back.append("ip4")
+        if config.trackers_proxy == "disable":
+            for ip_type, opened in self.site.connection_server.port_opened.items():
+                if opened:
+                    back.append(ip_type)
         if self.site.connection_server.tor_manager.start_onions:
             back.append("onion")
         return back
 
     @util.Noparallel(blocking=False)
     def announce(self, force=False, mode="start", pex=True):
-        if time.time() < self.time_last_announce + 30 and not force:
+        if time.time() - self.time_last_announce < 30 and not force:
             return  # No reannouncing within 30 secs
         if force:
             self.site.log.debug("Force reannounce in mode %s" % mode)
@@ -85,6 +98,12 @@ class SiteAnnouncer(object):
         num_announced = 0
 
         for tracker in trackers:  # Start announce threads
+            tracker_stats = global_stats[tracker]
+            # Reduce the announce time for trackers that looks unreliable
+            if tracker_stats["num_error"] > 5 and tracker_stats["time_request"] > time.time() - 60 * min(30, tracker_stats["num_error"]):
+                if config.verbose:
+                    self.site.log.debug("Tracker %s looks unreliable, announce skipped (error: %s)" % (tracker, tracker_stats["num_error"]))
+                continue
             thread = gevent.spawn(self.announceTracker, tracker, mode=mode)
             threads.append(thread)
             thread.tracker = tracker
@@ -95,6 +114,8 @@ class SiteAnnouncer(object):
         gevent.joinall(threads, timeout=20)  # Wait for announce finish
 
         for thread in threads:
+            if thread.value is None:
+                continue
             if thread.value is not False:
                 if thread.value > 1.0:  # Takes more than 1 second to announce
                     slow.append("%.2fs %s" % (thread.value, thread.tracker))
@@ -120,7 +141,10 @@ class SiteAnnouncer(object):
                 )
         else:
             if len(threads) > 1:
-                self.site.log.error("Announce to %s trackers in %.3fs, failed" % (num_announced, time.time() - s))
+                self.site.log.error("Announce to %s trackers in %.3fs, failed" % (len(threads), time.time() - s))
+            if len(threads) == 1 and mode != "start":  # Move to next tracker
+                self.site.log.debug("Tracker failed, skipping to next one...")
+                gevent.spawn_later(1.0, self.announce, force=force, mode=mode, pex=pex)
 
         self.updateWebsocket(trackers="announced")
 
@@ -138,22 +162,44 @@ class SiteAnnouncer(object):
             handler = self.announceTrackerUdp
         elif protocol == "http":
             handler = self.announceTrackerHttp
+        elif protocol == "https":
+            handler = self.announceTrackerHttps
         else:
             handler = None
         return handler
 
+    def getAddressParts(self, tracker):
+        if "://" not in tracker or not re.match("^[A-Za-z0-9:/\\.#-]+$", tracker):
+            return None
+        protocol, address = tracker.split("://", 1)
+        try:
+            ip, port = address.rsplit(":", 1)
+        except ValueError as err:
+            ip = address
+            port = 80
+            if protocol.startswith("https"):
+                port = 443
+        back = {}
+        back["protocol"] = protocol
+        back["address"] = address
+        back["ip"] = ip
+        back["port"] = port
+        return back
+
     def announceTracker(self, tracker, mode="start", num_want=10):
         s = time.time()
-        if "://" not in tracker:
-            self.site.log.warning("Tracker %s error: Invalid address" % tracker)
+        address_parts = self.getAddressParts(tracker)
+        if not address_parts:
+            self.site.log.warning("Tracker %s error: Invalid address" % tracker.decode("utf8", "ignore"))
             return False
-        protocol, address = tracker.split("://", 1)
-        if tracker not in self.stats:
-            self.stats[tracker] = {"status": "", "num_request": 0, "num_success": 0, "num_error": 0, "time_request": 0}
 
+        if tracker not in self.stats:
+            self.stats[tracker] = {"status": "", "num_request": 0, "num_success": 0, "num_error": 0, "time_request": 0, "time_last_error": 0}
+
+        last_status = self.stats[tracker]["status"]
         self.stats[tracker]["status"] = "announcing"
         self.stats[tracker]["time_request"] = time.time()
-        self.stats[tracker]["num_request"] += 1
+        global_stats[tracker]["time_request"] = time.time()
         if config.verbose:
             self.site.log.debug("Tracker announcing to %s (mode: %s)" % (tracker, mode))
         if mode == "update":
@@ -161,30 +207,42 @@ class SiteAnnouncer(object):
         else:
             num_want = 30
 
-        handler = self.getTrackerHandler(protocol)
+        handler = self.getTrackerHandler(address_parts["protocol"])
         error = None
         try:
             if handler:
-                peers = handler(address, mode=mode, num_want=num_want)
+                peers = handler(address_parts["address"], mode=mode, num_want=num_want)
             else:
-                raise AnnounceError("Unknown protocol: %s" % protocol)
+                raise AnnounceError("Unknown protocol: %s" % address_parts["protocol"])
         except Exception, err:
-            self.site.log.warning("Tracker %s announce failed: %s" % (tracker, str(err).decode("utf8", "ignore")))
+            self.site.log.warning("Tracker %s announce failed: %s in mode %s" % (tracker, str(err).decode("utf8", "ignore"), mode))
             error = err
 
         if error:
             self.stats[tracker]["status"] = "error"
             self.stats[tracker]["time_status"] = time.time()
             self.stats[tracker]["last_error"] = str(err).decode("utf8", "ignore")
+            self.stats[tracker]["time_last_error"] = time.time()
             self.stats[tracker]["num_error"] += 1
+            self.stats[tracker]["num_request"] += 1
+            global_stats[tracker]["num_request"] += 1
+            global_stats[tracker]["num_error"] += 1
             self.updateWebsocket(tracker="error")
             return False
+
+        if peers is None:  # Announce skipped
+            self.stats[tracker]["time_status"] = time.time()
+            self.stats[tracker]["status"] = last_status
+            return None
 
         self.stats[tracker]["status"] = "announced"
         self.stats[tracker]["time_status"] = time.time()
         self.stats[tracker]["num_success"] += 1
+        self.stats[tracker]["num_request"] += 1
+        global_stats[tracker]["num_request"] += 1
+        global_stats[tracker]["num_error"] = 0
 
-        if peers is None:  # No peers returned
+        if peers is True:  # Announce success, but no peers returned
             return time.time() - s
 
         # Adding peers
@@ -204,7 +262,7 @@ class SiteAnnouncer(object):
         if config.verbose:
             self.site.log.debug(
                 "Tracker result: %s://%s (found %s peers, new: %s, total: %s)" %
-                (protocol, address, len(peers), added, len(self.site.peers))
+                (address_parts["protocol"], address_parts["address"], len(peers), added, len(self.site.peers))
             )
         return time.time() - s
 
@@ -215,14 +273,15 @@ class SiteAnnouncer(object):
         if config.trackers_proxy != "disable":
             raise AnnounceError("Udp trackers not available with proxies")
 
-        ip, port = tracker_address.split(":")
+        ip, port = tracker_address.split("/")[0].split(":")
         tracker = UdpTrackerClient(ip, int(port))
-        if "ip4" in self.getOpenedServiceTypes():
+        if helper.getIpType(ip) in self.getOpenedServiceTypes():
             tracker.peer_port = self.fileserver_port
         else:
             tracker.peer_port = 0
         tracker.connect()
-        tracker.poll_once()
+        if not tracker.poll_once():
+            raise AnnounceError("Could not connect")
         tracker.announce(info_hash=hashlib.sha1(self.site.address).hexdigest(), num_want=num_want, left=431102370)
         back = tracker.poll_once()
         if not back:
@@ -235,16 +294,37 @@ class SiteAnnouncer(object):
         return peers
 
     def httpRequest(self, url):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.11 (KHTML, like Gecko) Chrome/23.0.1271.64 Safari/537.11',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.3',
+            'Accept-Encoding': 'none',
+            'Accept-Language': 'en-US,en;q=0.8',
+            'Connection': 'keep-alive'
+        }
+
+        req = urllib2.Request(url, headers=headers)
+
         if config.trackers_proxy == "tor":
             tor_manager = self.site.connection_server.tor_manager
             handler = sockshandler.SocksiPyHandler(socks.SOCKS5, tor_manager.proxy_ip, tor_manager.proxy_port)
             opener = urllib2.build_opener(handler)
-            return opener.open(url, timeout=50)
+            return opener.open(req, timeout=50)
+        elif config.trackers_proxy == "disable":
+            return urllib2.urlopen(req, timeout=25)
         else:
-            return urllib2.urlopen(url, timeout=25)
+            proxy_ip, proxy_port = config.trackers_proxy.split(":")
+            handler = sockshandler.SocksiPyHandler(socks.SOCKS5, proxy_ip, int(proxy_port))
+            opener = urllib2.build_opener(handler)
+            return opener.open(req, timeout=50)
 
-    def announceTrackerHttp(self, tracker_address, mode="start", num_want=10):
-        if "ip4" in self.getOpenedServiceTypes():
+    def announceTrackerHttps(self, *args, **kwargs):
+        kwargs["protocol"] = "https"
+        return self.announceTrackerHttp(*args, **kwargs)
+
+    def announceTrackerHttp(self, tracker_address, mode="start", num_want=10, protocol="http"):
+        tracker_ip, tracker_port = tracker_address.rsplit(":", 1)
+        if helper.getIpType(tracker_ip) in self.getOpenedServiceTypes():
             port = self.fileserver_port
         else:
             port = 1
@@ -255,7 +335,7 @@ class SiteAnnouncer(object):
             'event': 'started'
         }
 
-        url = "http://" + tracker_address + "?" + urllib.urlencode(params)
+        url = protocol + "://" + tracker_address + "?" + urllib.urlencode(params)
 
         s = time.time()
         response = None

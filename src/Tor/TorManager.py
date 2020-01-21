@@ -52,10 +52,10 @@ class TorManager(object):
         else:
             self.fileserver_port = config.fileserver_port
 
-        self.ip, self.port = config.tor_controller.split(":")
+        self.ip, self.port = config.tor_controller.rsplit(":", 1)
         self.port = int(self.port)
 
-        self.proxy_ip, self.proxy_port = config.tor_proxy.split(":")
+        self.proxy_ip, self.proxy_port = config.tor_proxy.rsplit(":", 1)
         self.proxy_port = int(self.proxy_port)
 
     def start(self):
@@ -66,7 +66,10 @@ class TorManager(object):
                 raise Exception("No connection")
             self.log.debug("Tor proxy port %s check ok" % config.tor_proxy)
         except Exception, err:
-            self.log.info(u"Starting self-bundled Tor, due to Tor proxy port %s check error: %s" % (config.tor_proxy, err))
+            if sys.platform.startswith("win"):
+                self.log.info(u"Starting self-bundled Tor, due to Tor proxy port %s check error: %s" % (config.tor_proxy, err))
+            else:
+                self.log.info(u"Disabling Tor, because error while accessing Tor proxy at port %s: %s" % (config.tor_proxy, err))
             self.enabled = False
             # Change to self-bundled Tor ports
             from lib.PySocks import socks
@@ -208,12 +211,13 @@ class TorManager(object):
 
                 self.setStatus(u"Connected (%s)" % res_auth)
                 self.event_started.set(True)
+                self.starting = False
                 self.connecting = False
                 self.conn = conn
         except Exception, err:
             self.conn = None
             self.setStatus(u"Error (%s)" % str(err).decode("utf8", "ignore"))
-            self.log.warning(u"Tor controller connect error: %s" % Debug.formatException(str(err).decode("utf8", "ignore")))
+            self.log.error(u"Tor controller connect error: %s" % Debug.formatException(str(err).decode("utf8", "ignore")))
             self.enabled = False
         return self.conn
 
@@ -297,7 +301,8 @@ class TorManager(object):
                 time.sleep(1)
                 self.connect()
                 back = None
-        self.log.debug("< %s" % back.strip())
+        if back:
+            self.log.debug("< %s" % back.strip())
         return back
 
     def getPrivatekey(self, address):
@@ -307,19 +312,22 @@ class TorManager(object):
         return CryptRsa.privatekeyToPublickey(self.privatekeys[address])
 
     def getOnion(self, site_address):
-        with self.lock:
-            if not self.enabled:
-                return None
-            if config.tor == "always":  # Different onion for every site
-                onion = self.site_onions.get(site_address)
-            else:  # Same onion for every site
-                onion = self.site_onions.get("global")
-                site_address = "global"
-            if not onion:
+        if not self.enabled:
+            return None
+
+        if config.tor == "always":  # Different onion for every site
+            onion = self.site_onions.get(site_address)
+        else:  # Same onion for every site
+            onion = self.site_onions.get("global")
+            site_address = "global"
+
+        if not onion:
+            with self.lock:
                 self.site_onions[site_address] = self.addOnion()
                 onion = self.site_onions[site_address]
                 self.log.debug("Created new hidden service for %s: %s" % (site_address, onion))
-            return onion
+
+        return onion
 
     # Creates and returns a
     # socket that has connected to the Tor Network

@@ -46,7 +46,7 @@ class SiteManager(object):
                     self.sites[address] = site
                     self.log.debug("Loaded site %s in %.3fs" % (address, time.time() - s))
                     added += 1
-                elif startup and (settings.get("peers", 0) > 0 or settings.get("own")):
+                elif startup:
                     # No site directory, start download
                     self.log.debug("Found new site in sites.json: %s" % address)
                     gevent.spawn(self.need, address, settings=settings)
@@ -175,7 +175,7 @@ class SiteManager(object):
 site_manager = SiteManager()  # Singletone
 
 if config.action == "main":  # Don't connect / add myself to peerlist
-    peer_blacklist = [("127.0.0.1", config.fileserver_port)]
+    peer_blacklist = [("127.0.0.1", config.fileserver_port), ("::1", config.fileserver_port)]
 else:
     peer_blacklist = []
 

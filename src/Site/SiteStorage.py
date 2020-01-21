@@ -45,10 +45,10 @@ class SiteStorage(object):
             return False
 
     # Create new databaseobject  with the site's schema
-    def openDb(self):
+    def openDb(self, close_idle=False):
         schema = self.getDbSchema()
         db_path = self.getPath(schema["db_file"])
-        return Db(schema, db_path)
+        return Db(schema, db_path, close_idle=close_idle)
 
     def closeDb(self):
         if self.db:
@@ -77,7 +77,7 @@ class SiteStorage(object):
 
                 if self.db:
                     self.db.close()
-                self.db = self.openDb()
+                self.db = self.openDb(close_idle=True)
 
                 changed_tables = self.db.checkTables()
                 if changed_tables:
@@ -114,6 +114,7 @@ class SiteStorage(object):
                     time.sleep(0.000001)  # Context switch to avoid UI block
 
     # Rebuild sql cache
+    @util.Noparallel()
     def rebuildDb(self, delete_db=True):
         self.has_db = self.isFile("dbschema.json")
         if not self.has_db:
@@ -172,6 +173,9 @@ class SiteStorage(object):
 
     # Execute sql query or rebuild on dberror
     def query(self, query, params=None):
+        if not query.strip().upper().startswith("SELECT"):
+            raise Exception("Only SELECT query supported")
+
         if self.event_db_busy:  # Db not ready for queries
             self.log.debug("Wating for db...")
             self.event_db_busy.get()  # Wait for event
@@ -358,7 +362,7 @@ class SiteStorage(object):
         if not inner_path:
             return self.directory
 
-        if ".." in inner_path:
+        if "../" in inner_path:
             raise Exception(u"File not allowed: %s" % inner_path)
 
         return u"%s/%s" % (self.directory, inner_path)
@@ -369,7 +373,7 @@ class SiteStorage(object):
             inner_path = ""
         else:
             if path.startswith(self.directory):
-                inner_path = path[len(self.directory)+1:]
+                inner_path = path[len(self.directory) + 1:]
             else:
                 raise Exception(u"File not allowed: %s" % path)
         return inner_path

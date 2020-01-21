@@ -1,5 +1,7 @@
 import time
 import re
+from util import helper
+
 
 # Special sqlite cursor
 
@@ -22,10 +24,20 @@ class DbCursor:
                 for key, value in params.items():
                     if type(value) is list:
                         if key.startswith("not__"):
-                            query_wheres.append(key.replace("not__", "") + " NOT IN (" + ",".join(["?"] * len(value)) + ")")
+                            field = key.replace("not__", "")
+                            operator = "NOT IN"
                         else:
-                            query_wheres.append(key + " IN (" + ",".join(["?"] * len(value)) + ")")
-                        values += value
+                            field = key
+                            operator = "IN"
+                        if len(value) > 100:
+                            # Embed values in query to avoid "too many SQL variables" error
+                            query_values = ",".join(map(helper.sqlquote, value))
+                        else:
+                            query_values = ",".join(["?"] * len(value))
+                            values += value
+                        query_wheres.append("%s %s (%s)" %
+                            (field, operator, query_values)
+                        )
                     else:
                         if key.startswith("not__"):
                             query_wheres.append(key.replace("not__", "") + " != ?")
@@ -65,7 +77,6 @@ class DbCursor:
 
 
         s = time.time()
-        # if query == "COMMIT": self.logging = True # Turn logging back on transaction commit
 
         if params:  # Query has parameters
             res = self.cursor.execute(query, params)
@@ -83,7 +94,6 @@ class DbCursor:
             self.db.query_stats[query]["call"] += 1
             self.db.query_stats[query]["time"] += time.time() - s
 
-        # if query == "BEGIN": self.logging = False # Turn logging off on transaction commit
         return res
 
     # Creates on updates a database row without incrementing the rowid
@@ -116,8 +126,10 @@ class DbCursor:
     # Create indexes on table
     # Return: True on success
     def createIndexes(self, table, indexes):
-        # indexes.append("CREATE INDEX %s_id ON %s(%s_id)" % (table, table, table)) # Primary key index
         for index in indexes:
+            if not index.strip().upper().startswith("CREATE"):
+                self.db.log.error("Index command should start with CREATE: %s" % index)
+                continue
             self.execute(index)
 
     # Create table if not exist

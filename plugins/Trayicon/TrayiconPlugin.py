@@ -64,7 +64,7 @@ class ActionsPlugin(object):
 
         icon.clicked = lambda: self.opensite("http://%s:%s/%s" % (ui_ip, config.ui_port, config.homepage))
         self.quit_servers_event = gevent.threadpool.ThreadResult(
-            lambda res: gevent.spawn_later(0.1, self.quitServers)
+            lambda res: gevent.spawn_later(0.1, self.quitServers), gevent.threadpool.get_hub(), lambda: True
         )  # Fix gevent thread switch error
         gevent.threadpool.start_new_thread(icon._run, ())  # Start in real thread (not gevent compatible)
         super(ActionsPlugin, self).main()
@@ -83,8 +83,8 @@ class ActionsPlugin(object):
         webbrowser.open(url, new=0)
 
     def titleIp(self):
-        title = "!IP: %s " % config.ip_external
-        if self.main.file_server.port_opened:
+        title = "!IP: %s " % ", ".join(self.main.file_server.ip_external_list)
+        if any(self.main.file_server.port_opened):
             title += _["(active)"]
         else:
             title += _["(passive)"]

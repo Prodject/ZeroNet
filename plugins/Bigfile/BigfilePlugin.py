@@ -3,10 +3,12 @@ import os
 import subprocess
 import shutil
 import collections
-import gevent
 import math
+import json
 
 import msgpack
+import gevent
+import gevent.lock
 
 from Plugin import PluginManager
 from Debug import Debug
@@ -95,12 +97,12 @@ class UiRequestPlugin(object):
 
             site.content_manager.contents.loadItem(file_info["content_inner_path"])  # reload cache
 
-        return {
+        return json.dumps({
             "merkle_root": merkle_root,
             "piece_num": len(piecemap_info["sha512_pieces"]),
             "piece_size": piece_size,
             "inner_path": inner_path
-        }
+        })
 
     def readMultipartHeaders(self, wsgi_input):
         for i in range(100):
@@ -113,7 +115,10 @@ class UiRequestPlugin(object):
         if kwargs.get("file_size", 0) > 1024 * 1024 and kwargs.get("path_parts"):  # Only check files larger than 1MB
             path_parts = kwargs["path_parts"]
             site = self.server.site_manager.get(path_parts["address"])
-            kwargs["file_obj"] = site.storage.openBigfile(path_parts["inner_path"], prebuffer=2 * 1024 * 1024)
+            big_file = site.storage.openBigfile(path_parts["inner_path"], prebuffer=2 * 1024 * 1024)
+            if big_file:
+                kwargs["file_obj"] = big_file
+                kwargs["file_size"] = big_file.size
 
         return super(UiRequestPlugin, self).actionFile(file_path, *args, **kwargs)
 
@@ -367,6 +372,7 @@ class ContentManagerPlugin(object):
             for key in self.site.bad_files.keys():
                 if key.startswith(inner_path + "|"):
                     del self.site.bad_files[key]
+            self.site.worker_manager.removeSolvedFileTasks()
         return super(ContentManagerPlugin, self).optionalRemoved(inner_path, hash_id, size)
 
 
@@ -389,7 +395,7 @@ class SiteStoragePlugin(object):
             os.makedirs(file_dir)
 
         f = open(file_path, 'wb')
-        f.truncate(size)
+        f.truncate(min(1024 * 1024 * 5, size))  # Only pre-allocate up to 5MB
         f.close()
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -472,55 +478,61 @@ class BigFile(object):
 
         self.piecefield = self.site.storage.piecefields[self.sha512]
         self.f = open(file_path, "rb+")
+        self.read_lock = gevent.lock.Semaphore()
 
     def read(self, buff=64 * 1024):
-        pos = self.f.tell()
-        read_until = min(self.size, pos + buff)
-        requests = []
-        # Request all required blocks
-        while 1:
-            piece_i = pos / self.piece_size
-            if piece_i * self.piece_size >= read_until:
-                break
-            pos_from = piece_i * self.piece_size
-            pos_to = pos_from + self.piece_size
-            if not self.piecefield[piece_i]:
-                requests.append(self.site.needFile("%s|%s-%s" % (self.inner_path, pos_from, pos_to), blocking=False, update=True, priority=10))
-            pos += self.piece_size
-
-        if not all(requests):
-            return None
-
-        # Request prebuffer
-        if self.prebuffer:
-            prebuffer_until = min(self.size, read_until + self.prebuffer)
-            priority = 3
+        with self.read_lock:
+            pos = self.f.tell()
+            read_until = min(self.size, pos + buff)
+            requests = []
+            # Request all required blocks
             while 1:
                 piece_i = pos / self.piece_size
-                if piece_i * self.piece_size >= prebuffer_until:
+                if piece_i * self.piece_size >= read_until:
                     break
                 pos_from = piece_i * self.piece_size
                 pos_to = pos_from + self.piece_size
                 if not self.piecefield[piece_i]:
-                    self.site.needFile("%s|%s-%s" % (self.inner_path, pos_from, pos_to), blocking=False, update=True, priority=max(0, priority))
-                priority -= 1
+                    requests.append(self.site.needFile("%s|%s-%s" % (self.inner_path, pos_from, pos_to), blocking=False, update=True, priority=10))
                 pos += self.piece_size
 
-        gevent.joinall(requests)
-        self.read_bytes += buff
+            if not all(requests):
+                return None
 
-        # Increase buffer for long reads
-        if self.read_bytes > 7 * 1024 * 1024 and self.prebuffer < 5 * 1024 * 1024:
-            self.site.log.debug("%s: Increasing bigfile buffer size to 5MB..." % self.inner_path)
-            self.prebuffer = 5 * 1024 * 1024
+            # Request prebuffer
+            if self.prebuffer:
+                prebuffer_until = min(self.size, read_until + self.prebuffer)
+                priority = 3
+                while 1:
+                    piece_i = pos / self.piece_size
+                    if piece_i * self.piece_size >= prebuffer_until:
+                        break
+                    pos_from = piece_i * self.piece_size
+                    pos_to = pos_from + self.piece_size
+                    if not self.piecefield[piece_i]:
+                        self.site.needFile("%s|%s-%s" % (self.inner_path, pos_from, pos_to), blocking=False, update=True, priority=max(0, priority))
+                    priority -= 1
+                    pos += self.piece_size
 
-        return self.f.read(buff)
+            gevent.joinall(requests)
+            self.read_bytes += buff
 
-    def seek(self, pos):
-        return self.f.seek(pos)
+            # Increase buffer for long reads
+            if self.read_bytes > 7 * 1024 * 1024 and self.prebuffer < 5 * 1024 * 1024:
+                self.site.log.debug("%s: Increasing bigfile buffer size to 5MB..." % self.inner_path)
+                self.prebuffer = 5 * 1024 * 1024
+
+            return self.f.read(buff)
+
+    def seek(self, pos, whence=0):
+        with self.read_lock:
+            if whence == 2:  # Relative from file end
+                pos = self.size + pos  # Use the real size instead of size on the disk
+                whence = 0
+            return self.f.seek(pos, whence)
 
     def tell(self):
-        self.f.tell()
+        return self.f.tell()
 
     def close(self):
         self.f.close()
@@ -593,9 +605,10 @@ class FileRequestPlugin(object):
         if file.read(10) == "\0" * 10:
             # Looks empty, but makes sures we don't have that piece
             file_info = site.content_manager.getFileInfo(inner_path)
-            piece_i = pos / file_info["piece_size"]
-            if not site.storage.piecefields[file_info["sha512"]][piece_i]:
-                return False
+            if "piece_size" in file_info:
+                piece_i = pos / file_info["piece_size"]
+                if not site.storage.piecefields[file_info["sha512"]][piece_i]:
+                    return False
         # Seek back to position we want to read
         file.seek(pos)
         return super(FileRequestPlugin, self).isReadable(site, inner_path, file, pos)
@@ -694,6 +707,14 @@ class PeerPlugin(object):
 class SitePlugin(object):
     def isFileDownloadAllowed(self, inner_path, file_info):
         if "piecemap" in file_info:
+            file_size_mb = file_info["size"] / 1024 / 1024
+            if config.bigfile_size_limit and file_size_mb > config.bigfile_size_limit:
+                self.log.debug(
+                    "Bigfile size %s too large: %sMB > %sMB, skipping..." %
+                    (inner_path, file_size_mb, config.bigfile_size_limit)
+                )
+                return False
+
             file_info = file_info.copy()
             file_info["size"] = file_info["piece_size"]
         return super(SitePlugin, self).isFileDownloadAllowed(inner_path, file_info)
@@ -707,8 +728,11 @@ class SitePlugin(object):
     def needFile(self, inner_path, *args, **kwargs):
         if inner_path.endswith("|all"):
             @util.Pooled(20)
-            def pooledNeedBigfile(*args, **kwargs):
-                return self.needFile(*args, **kwargs)
+            def pooledNeedBigfile(inner_path, *args, **kwargs):
+                if inner_path not in self.bad_files:
+                    self.log.debug("Cancelled piece, skipping %s" % inner_path)
+                    return False
+                return self.needFile(inner_path, *args, **kwargs)
 
             inner_path = inner_path.replace("|all", "")
             file_info = self.needFileInfo(inner_path)
@@ -725,7 +749,9 @@ class SitePlugin(object):
                 piece_from = piece_i * piece_size
                 piece_to = min(file_size, piece_from + piece_size)
                 if not piecefield or not piecefield[piece_i]:
-                    res = pooledNeedBigfile("%s|%s-%s" % (inner_path, piece_from, piece_to), blocking=False)
+                    inner_path_piece = "%s|%s-%s" % (inner_path, piece_from, piece_to)
+                    self.bad_files[inner_path_piece] = self.bad_files.get(inner_path_piece, 1)
+                    res = pooledNeedBigfile(inner_path_piece, blocking=False)
                     if res is not True and res is not False:
                         file_threads.append(res)
             gevent.joinall(file_threads)
@@ -738,5 +764,6 @@ class ConfigPlugin(object):
     def createArguments(self):
         group = self.parser.add_argument_group("Bigfile plugin")
         group.add_argument('--autodownload_bigfile_size_limit', help='Also download bigfiles smaller than this limit if help distribute option is checked', default=1, metavar="MB", type=int)
+        group.add_argument('--bigfile_size_limit', help='Maximum size of downloaded big files', default=False, metavar="MB", type=int)
 
         return super(ConfigPlugin, self).createArguments()

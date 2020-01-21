@@ -16,8 +16,6 @@ import Spy
 @pytest.mark.usefixtures("resetSettings")
 class TestSiteDownload:
     def testDownload(self, file_server, site, site_temp):
-        file_server.ip_incoming = {}  # Reset flood protection
-
         assert site.storage.directory == config.data_dir + "/" + site.address
         assert site_temp.storage.directory == config.data_dir + "-temp/" + site.address
 
@@ -26,11 +24,11 @@ class TestSiteDownload:
         file_server.sites[site.address] = site
 
         # Init client server
-        client = ConnectionServer("127.0.0.1", 1545)
+        client = ConnectionServer(file_server.ip, 1545)
         site_temp.connection_server = client
         site_temp.announce = mock.MagicMock(return_value=True)  # Don't try to find peers from the net
 
-        site_temp.addPeer("127.0.0.1", 1544)
+        site_temp.addPeer(file_server.ip, 1544)
         with Spy.Spy(FileRequest, "route") as requests:
             def boostRequest(inner_path):
                 # I really want these file
@@ -58,19 +56,17 @@ class TestSiteDownload:
         [connection.close() for connection in file_server.connections]
 
     def testArchivedDownload(self, file_server, site, site_temp):
-        file_server.ip_incoming = {}  # Reset flood protection
-
         # Init source server
         site.connection_server = file_server
         file_server.sites[site.address] = site
 
         # Init client server
-        client = FileServer("127.0.0.1", 1545)
+        client = FileServer(file_server.ip, 1545)
         client.sites[site_temp.address] = site_temp
         site_temp.connection_server = client
 
         # Download normally
-        site_temp.addPeer("127.0.0.1", 1544)
+        site_temp.addPeer(file_server.ip, 1544)
         site_temp.download(blind_includes=True).join(timeout=5)
         bad_files = site_temp.storage.verifyFiles(quick_check=True)["bad_files"]
 
@@ -107,20 +103,68 @@ class TestSiteDownload:
         assert site_temp.storage.deleteFiles()
         [connection.close() for connection in file_server.connections]
 
-    # Test when connected peer has the optional file
-    def testOptionalDownload(self, file_server, site, site_temp):
-        file_server.ip_incoming = {}  # Reset flood protection
-
+    def testArchivedBeforeDownload(self, file_server, site, site_temp):
         # Init source server
         site.connection_server = file_server
         file_server.sites[site.address] = site
 
         # Init client server
-        client = ConnectionServer("127.0.0.1", 1545)
+        client = FileServer(file_server.ip, 1545)
+        client.sites[site_temp.address] = site_temp
+        site_temp.connection_server = client
+
+        # Download normally
+        site_temp.addPeer(file_server.ip, 1544)
+        site_temp.download(blind_includes=True).join(timeout=5)
+        bad_files = site_temp.storage.verifyFiles(quick_check=True)["bad_files"]
+
+        assert not bad_files
+        assert "data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json" in site_temp.content_manager.contents
+        assert site_temp.storage.isFile("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json")
+        assert len(list(site_temp.storage.query("SELECT * FROM comment"))) == 2
+
+        # Add archived data
+        assert not "archived_before" in site.content_manager.contents["data/users/content.json"]["user_contents"]
+        assert not site.content_manager.isArchived("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json", time.time()-1)
+
+        content_modification_time = site.content_manager.contents["data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json"]["modified"]
+        site.content_manager.contents["data/users/content.json"]["user_contents"]["archived_before"] = content_modification_time
+        site.content_manager.sign("data/users/content.json", privatekey="5KUh3PvNm5HUWoCfSUfcYvfQ2g3PrRNJWr6Q9eqdBGu23mtMntv")
+
+        date_archived = site.content_manager.contents["data/users/content.json"]["user_contents"]["archived_before"]
+        assert site.content_manager.isArchived("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json", date_archived-1)
+        assert site.content_manager.isArchived("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json", date_archived)
+        assert not site.content_manager.isArchived("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json", date_archived+1)  # Allow user to update archived data later
+
+        # Push archived update
+        assert not "archived_before" in site_temp.content_manager.contents["data/users/content.json"]["user_contents"]
+        site.publish()
+        time.sleep(0.1)
+        site_temp.download(blind_includes=True).join(timeout=5)  # Wait for download
+
+        # The archived content should disappear from remote client
+        assert "archived_before" in site_temp.content_manager.contents["data/users/content.json"]["user_contents"]
+        assert "data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q/content.json" not in site_temp.content_manager.contents
+        assert not site_temp.storage.isDir("data/users/1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q")
+        assert len(list(site_temp.storage.query("SELECT * FROM comment"))) == 1
+        assert len(list(site_temp.storage.query("SELECT * FROM json WHERE directory LIKE '%1C5sgvWaSgfaTpV5kjBCnCiKtENNMYo69q%'"))) == 0
+
+        assert site_temp.storage.deleteFiles()
+        [connection.close() for connection in file_server.connections]
+
+
+    # Test when connected peer has the optional file
+    def testOptionalDownload(self, file_server, site, site_temp):
+        # Init source server
+        site.connection_server = file_server
+        file_server.sites[site.address] = site
+
+        # Init client server
+        client = ConnectionServer(file_server.ip, 1545)
         site_temp.connection_server = client
         site_temp.announce = mock.MagicMock(return_value=True)  # Don't try to find peers from the net
 
-        site_temp.addPeer("127.0.0.1", 1544)
+        site_temp.addPeer(file_server.ip, 1544)
 
         # Download site
         site_temp.download(blind_includes=True).join(timeout=5)
@@ -153,15 +197,13 @@ class TestSiteDownload:
 
     # Test when connected peer does not has the file, so ask him if he know someone who has it
     def testFindOptional(self, file_server, site, site_temp):
-        file_server.ip_incoming = {}  # Reset flood protection
-
         # Init source server
         site.connection_server = file_server
         file_server.sites[site.address] = site
 
         # Init full source server (has optional files)
         site_full = Site("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")
-        file_server_full = FileServer("127.0.0.1", 1546)
+        file_server_full = FileServer(file_server.ip, 1546)
         site_full.connection_server = file_server_full
 
         def listen():
@@ -172,7 +214,7 @@ class TestSiteDownload:
         time.sleep(0.001)  # Port opening
         file_server_full.sites[site_full.address] = site_full  # Add site
         site_full.storage.verifyFiles(quick_check=True)  # Check optional files
-        site_full_peer = site.addPeer("127.0.0.1", 1546)  # Add it to source server
+        site_full_peer = site.addPeer(file_server.ip, 1546)  # Add it to source server
         hashfield = site_full_peer.updateHashfield()  # Update hashfield
         assert len(site_full.content_manager.hashfield) == 8
         assert hashfield
@@ -185,8 +227,8 @@ class TestSiteDownload:
             site.content_manager.hashfield.remove(hash)
 
         # Init client server
-        site_temp.connection_server = ConnectionServer("127.0.0.1", 1545)
-        site_temp.addPeer("127.0.0.1", 1544)  # Add source server
+        site_temp.connection_server = ConnectionServer(file_server.ip, 1545)
+        site_temp.addPeer(file_server.ip, 1544)  # Add source server
 
         # Download normal files
         site_temp.log.info("Start Downloading site")
@@ -220,10 +262,9 @@ class TestSiteDownload:
         assert site_temp.storage.deleteFiles()
         file_server_full.stop()
         [connection.close() for connection in file_server.connections]
+        site_full.content_manager.contents.db.close()
 
     def testUpdate(self, file_server, site, site_temp):
-        file_server.ip_incoming = {}  # Reset flood protection
-
         assert site.storage.directory == config.data_dir + "/" + site.address
         assert site_temp.storage.directory == config.data_dir + "-temp/" + site.address
 
@@ -232,7 +273,7 @@ class TestSiteDownload:
         file_server.sites[site.address] = site
 
         # Init client server
-        client = FileServer("127.0.0.1", 1545)
+        client = FileServer(file_server.ip, 1545)
         client.sites[site_temp.address] = site_temp
         site_temp.connection_server = client
 
@@ -241,7 +282,7 @@ class TestSiteDownload:
         site_temp.announce = mock.MagicMock(return_value=True)
 
         # Connect peers
-        site_temp.addPeer("127.0.0.1", 1544)
+        site_temp.addPeer(file_server.ip, 1544)
 
         # Download site from site to site_temp
         site_temp.download(blind_includes=True).join(timeout=5)
@@ -269,7 +310,7 @@ class TestSiteDownload:
 
         # Close connection to avoid update spam limit
         site.peers.values()[0].remove()
-        site.addPeer("127.0.0.1", 1545)
+        site.addPeer(file_server.ip, 1545)
         site_temp.peers.values()[0].ping()  # Connect back
         time.sleep(0.1)
 

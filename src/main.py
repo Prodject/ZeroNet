@@ -28,13 +28,7 @@ config.parse(silent=True)  # Plugins need to access the configuration
 if not config.arguments:  # Config parse failed, show the help screen and exit
     config.parse()
 
-# Create necessary files and dirs
-if not os.path.isdir(config.log_dir):
-    os.mkdir(config.log_dir)
-    try:
-        os.chmod(config.log_dir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-    except Exception as err:
-        print "Can't change permission of %s: %s" % (config.log_dir, err)
+config.initLogging()
 
 if not os.path.isdir(config.data_dir):
     os.mkdir(config.data_dir)
@@ -48,12 +42,8 @@ if not os.path.isfile("%s/sites.json" % config.data_dir):
 if not os.path.isfile("%s/users.json" % config.data_dir):
     open("%s/users.json" % config.data_dir, "w").write("{}")
 
-# Setup logging
-logging.WARNING = 15  # Don't display warnings if not in debug mode
-logging.addLevelName(15, "WARNING")
 if config.action == "main":
     from util import helper
-    log_file_path = "%s/debug.log" % config.log_dir
     try:
         lock = helper.openLocked("%s/lock.pid" % config.data_dir, "w")
         lock.write("%s" % os.getpid())
@@ -72,41 +62,9 @@ if config.action == "main":
                 print "Error starting browser: %s" % err
         sys.exit()
 
-    if os.path.isfile("%s/debug.log" % config.log_dir):  # Simple logrotate
-        if os.path.isfile("%s/debug-last.log" % config.log_dir):
-            os.unlink("%s/debug-last.log" % config.log_dir)
-        os.rename("%s/debug.log" % config.log_dir, "%s/debug-last.log" % config.log_dir)
-    logging.basicConfig(
-        format='[%(asctime)s] %(levelname)-8s %(name)s %(message)s',
-        level=logging.getLevelName(config.log_level), stream=open(log_file_path, "a")
-    )
-else:
-    log_file_path = "%s/cmd.log" % config.log_dir
-    if config.silent:
-        level = logging.ERROR
-    else:
-        level = logging.DEBUG
-    logging.basicConfig(
-        format='[%(asctime)s] %(levelname)-8s %(name)s %(message)s',
-        level=level, stream=open(log_file_path, "w")
-    )
-
-# Console logger
-console_log = logging.StreamHandler()
-if config.action == "main":  # Add time if main action
-    console_log.setFormatter(logging.Formatter('[%(asctime)s] %(name)s %(message)s', "%H:%M:%S"))
-else:
-    console_log.setFormatter(logging.Formatter('%(name)s %(message)s', "%H:%M:%S"))
-
-logging.getLogger('').addHandler(console_log)  # Add console logger
-logging.getLogger('').name = "-"  # Remove root prefix
 
 # Debug dependent configuration
 from Debug import DebugHook
-if config.debug:
-    console_log.setLevel(logging.DEBUG)  # Display everything to console
-else:
-    console_log.setLevel(logging.INFO)  # Display only important info to console
 
 # Load plugins
 from Plugin import PluginManager
@@ -418,7 +376,7 @@ class Actions(object):
             time.sleep(0.001)
 
             # Started fileserver
-            file_server.openport()
+            file_server.portCheck()
             if peer_ip:  # Announce ip specificed
                 site.addPeer(peer_ip, peer_port)
             else:  # Just ask the tracker
@@ -452,7 +410,11 @@ class Actions(object):
 
     def cryptGetPrivatekey(self, master_seed, site_address_index=None):
         from Crypt import CryptBitcoin
-        print CryptBitcoin.hdPrivatekey(master_seed, site_address_index)
+        if len(master_seed) != 64:
+            logging.error("Error: Invalid master seed length: %s (required: 64)" % len(master_seed))
+            return False
+        privatekey = CryptBitcoin.hdPrivatekey(master_seed, site_address_index)
+        print "Requested private key: %s" % privatekey
 
     # Peer
     def peerPing(self, peer_ip, peer_port=None):

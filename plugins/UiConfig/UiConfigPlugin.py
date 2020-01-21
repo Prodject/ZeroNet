@@ -1,5 +1,11 @@
 from Plugin import PluginManager
 from Config import config
+from Translate import Translate
+from cStringIO import StringIO
+
+
+if "_" not in locals():
+    _ = Translate("plugins/UiConfig/languages/")
 
 
 @PluginManager.afterLoad
@@ -16,11 +22,14 @@ class UiRequestPlugin(object):
 
         if not extra_headers:
             extra_headers = {}
-        self.sendHeader(extra_headers=extra_headers)
+
+        script_nonce = self.getScriptNonce()
+
+        self.sendHeader(extra_headers=extra_headers, script_nonce=script_nonce)
         site = self.server.site_manager.get(config.homepage)
         return iter([super(UiRequestPlugin, self).renderWrapper(
             site, path, "uimedia/plugins/uiconfig/config.html",
-            "Config", extra_headers, show_loadingscreen=False
+            "Config", extra_headers, show_loadingscreen=False, script_nonce=script_nonce
         )])
 
     def actionUiMedia(self, path, *args, **kwargs):
@@ -30,7 +39,15 @@ class UiRequestPlugin(object):
                 # If debugging merge *.css to all.css and *.js to all.js
                 from Debug import DebugMedia
                 DebugMedia.merge(file_path)
-            return self.actionFile(file_path)
+
+            if file_path.endswith("js"):
+                data = _.translateData(open(file_path).read(), mode="js")
+            elif file_path.endswith("html"):
+                data = _.translateData(open(file_path).read(), mode="html")
+            else:
+                data = open(file_path).read()
+
+            return self.actionFile(file_path, file_obj=StringIO(data), file_size=len(data))
         else:
             return super(UiRequestPlugin, self).actionUiMedia(path)
 
@@ -44,10 +61,12 @@ class UiWebsocketPlugin(object):
         for key, val in config_values.iteritems():
             if key not in config.keys_api_change_allowed:
                 continue
+            is_pending = key in config.pending_changes
+            if val is None and is_pending:
+                val = config.parser.get_default(key)
             back[key] = {
                 "value": val,
                 "default": config.parser.get_default(key),
-                "pending": key in config.pending_changes
+                "pending": is_pending
             }
         return back
-

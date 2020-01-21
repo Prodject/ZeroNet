@@ -15,10 +15,16 @@ class ContentDb(Db):
         try:
             self.schema = self.getSchema()
             self.checkTables()
+            self.log.debug("Checking foreign keys...")
+            foreign_key_error = self.execute("PRAGMA foreign_key_check").fetchone()
+            if foreign_key_error:
+                raise Exception("Database foreign key error: %s" % foreign_key_error)
         except Exception, err:
             self.log.error("Error loading content.db: %s, rebuilding..." % Debug.formatException(err))
             self.close()
             os.unlink(path)  # Remove and try again
+            Db.__init__(self, {"db_name": "ContentDb", "tables": {}}, path)
+            self.foreign_keys = True
             self.schema = self.getSchema()
             self.checkTables()
         self.site_ids = {}
@@ -126,11 +132,13 @@ class ContentDb(Db):
 
         return row["size"], row["size_optional"]
 
-    def listModified(self, site, since):
-        res = self.execute(
-            "SELECT inner_path, modified FROM content WHERE site_id = :site_id AND modified > :since",
-            {"site_id": self.site_ids.get(site.address, 0), "since": since}
-        )
+    def listModified(self, site, after=None, before=None):
+        params = {"site_id": self.site_ids.get(site.address, 0)}
+        if after:
+            params["modified>"] = after
+        if before:
+            params["modified<"] = before
+        res = self.execute("SELECT inner_path, modified FROM content WHERE ?", params)
         return {row["inner_path"]: row["modified"] for row in res}
 
 content_dbs = {}

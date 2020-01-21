@@ -98,7 +98,7 @@ class UiWebsocketPlugin(object):
         # Add myself
         if site.settings["serving"]:
             peers_total += 1
-            if site.connection_server.port_opened:
+            if any(site.connection_server.port_opened.values()):
                 connectable += 1
             if site.connection_server.tor_manager.start_onions:
                 onion += 1
@@ -115,9 +115,19 @@ class UiWebsocketPlugin(object):
         else:
             local_html = ""
 
+        peer_ips = [peer.key for peer in site.getConnectablePeers(20, allow_private=False)]
+        peer_ips.sort(key=lambda peer_ip: ".onion:" in peer_ip)
+        copy_link = "http://127.0.0.1:43110/%s/?zeronet_peers=%s" % (
+            site.content_manager.contents["content.json"].get("domain", site.address),
+            ",".join(peer_ips)
+        )
+
         body.append(_(u"""
             <li>
-             <label>{_[Peers]}</label>
+             <label>
+              {_[Peers]}
+              <small class="label-right"><a href='{copy_link}' id='link-copypeers' class='link-right'>{_[Copy to clipboard]}</a></small>
+             </label>
              <ul class='graph'>
               <li style='width: 100%' class='total back-black' title="{_[Total peers]}"></li>
               <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='{_[Connectable peers]}'></li>
@@ -132,7 +142,7 @@ class UiWebsocketPlugin(object):
               <li class='color-black'><span>{_[Total]}:</span><b>{peers_total}</b></li>
              </ul>
             </li>
-        """))
+        """.replace("{local_html}", local_html)))
 
     def sidebarRenderTransferStats(self, body, site):
         recv = float(site.settings.get("bytes_recv", 0)) / 1024 / 1024
@@ -164,8 +174,8 @@ class UiWebsocketPlugin(object):
             <li>
              <label>
               {_[Files]}
-              <small><a href='#Site+directory' id='link-directory' class='link-right'>{_[Open site directory]}</a>
-              <a href='/ZeroNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Download as .zip]}</a></small>
+              <small class="label-right"><a href='#Site+directory' id='link-directory' class='link-right'>{_[Open site directory]}</a>
+              <a href='/ZeroNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Save as .zip]}</a></small>
              </label>
              <ul class='graph graph-stacked'>
         """))
@@ -186,7 +196,7 @@ class UiWebsocketPlugin(object):
         contents = site.content_manager.listContents()  # Without user files
         for inner_path in contents:
             content = site.content_manager.contents[inner_path]
-            if "files" not in content:
+            if "files" not in content or content["files"] is None:
                 continue
             for file_name, file_details in content["files"].items():
                 size_total += file_details["size"]
@@ -330,8 +340,10 @@ class UiWebsocketPlugin(object):
         i = 0
         for bad_file, tries in site.bad_files.iteritems():
             i += 1
-            body.append(_(u"""<li class='color-red' title="{bad_file} ({tries})">{bad_file}</li>""", {
-                "bad_file": cgi.escape(bad_file, True), "tries": _.pluralize(tries, "{} try", "{} tries")
+            body.append(_(u"""<li class='color-red' title="{bad_file_path} ({tries})">{bad_filename}</li>""", {
+                "bad_file_path": bad_file,
+                "bad_filename": helper.getFilename(bad_file),
+                "tries": _.pluralize(tries, "{} try", "{} tries")
             }))
             if i > 30:
                 break
@@ -367,7 +379,7 @@ class UiWebsocketPlugin(object):
         """, nested=True))
 
     def sidebarRenderIdentity(self, body, site):
-        auth_address = self.user.getAuthAddress(self.site.address)
+        auth_address = self.user.getAuthAddress(self.site.address, create=False)
         rules = self.site.content_manager.getRules("data/users/%s/content.json" % auth_address)
         if rules and rules.get("max_size"):
             quota = rules["max_size"] / 1024
@@ -391,7 +403,7 @@ class UiWebsocketPlugin(object):
         """))
 
     def sidebarRenderControls(self, body, site):
-        auth_address = self.user.getAuthAddress(self.site.address)
+        auth_address = self.user.getAuthAddress(self.site.address, create=False)
         if self.site.settings["serving"]:
             class_pause = ""
             class_resume = "hidden"
@@ -409,13 +421,30 @@ class UiWebsocketPlugin(object):
             </li>
         """))
 
+        donate_key = site.content_manager.contents.get("content.json", {}).get("donate", True)
         site_address = self.site.address
         body.append(_(u"""
             <li>
              <label>{_[Site address]}</label><br>
              <div class='flex'>
               <span class='input text disabled'>{site_address}</span>
+        """))
+        if donate_key == False or donate_key == "":
+            pass
+        elif (type(donate_key) == str or type(donate_key) == unicode) and len(donate_key) > 0:
+            body.append(_(u"""
+             </div>
+            </li>
+            <li>
+             <label>{_[Donate]}</label><br>
+             <div class='flex'>
+             {donate_key}
+            """))
+        else:
+            body.append(_(u"""
               <a href='bitcoin:{site_address}' class='button' id='button-donate'>{_[Donate]}</a>
+            """))
+        body.append(_(u"""
              </div>
             </li>
         """))
@@ -432,8 +461,8 @@ class UiWebsocketPlugin(object):
         """))
 
     def sidebarRenderOwnSettings(self, body, site):
-        title = cgi.escape(site.content_manager.contents.get("content.json", {}).get("title", ""), True)
-        description = cgi.escape(site.content_manager.contents.get("content.json", {}).get("description", ""), True)
+        title = site.content_manager.contents.get("content.json", {}).get("title", "")
+        description = site.content_manager.contents.get("content.json", {}).get("description", "")
 
         body.append(_(u"""
             <li>
@@ -452,10 +481,16 @@ class UiWebsocketPlugin(object):
         """))
 
     def sidebarRenderContents(self, body, site):
+        has_privatekey = bool(self.user.getSiteData(site.address, create=False).get("privatekey"))
+        if has_privatekey:
+            tag_privatekey = _(u"{_[Private key saved.]} <a href='#Forgot+private+key' id='privatekey-forgot' class='link-right'>{_[Forgot]}</a>")
+        else:
+            tag_privatekey = _(u"<a href='#Add+private+key' id='privatekey-add' class='link-right'>{_[Add saved private key]}</a>")
+
         body.append(_(u"""
             <li>
-             <label>{_[Content publishing]}</label>
-        """))
+             <label>{_[Content publishing]} <small class='label-right'>{tag_privatekey}</small></label>
+        """.replace("{tag_privatekey}", tag_privatekey)))
 
         # Choose content you want to sign
         body.append(_(u"""
@@ -470,8 +505,7 @@ class UiWebsocketPlugin(object):
         contents += site.content_manager.contents.get("content.json", {}).get("includes", {}).keys()
         body.append(_(u"<div class='contents'>{_[Choose]}: "))
         for content in contents:
-            content = cgi.escape(content, True)
-            body.append(_("<a href='#{content}' onclick='$(\"#input-contents\").val(\"{content}\"); return false'>{content}</a> "))
+            body.append(_("<a href='{content}' class='contents-content'>{content}</a> "))
         body.append("</div>")
         body.append("</li>")
 
@@ -619,7 +653,7 @@ class UiWebsocketPlugin(object):
             # Create position array
             lat, lon = loc["lat"], loc["lon"]
             latlon = "%s,%s" % (lat, lon)
-            if latlon in placed:  # Dont place more than 1 bar to same place, fake repos using ip address last two part
+            if latlon in placed and helper.getIpType(peer.ip) == "ipv4":  # Dont place more than 1 bar to same place, fake repos using ip address last two part
                 lat += float(128 - int(peer.ip.split(".")[-2])) / 50
                 lon += float(128 - int(peer.ip.split(".")[-1])) / 50
                 latlon = "%s,%s" % (lat, lon)
@@ -633,10 +667,11 @@ class UiWebsocketPlugin(object):
             peer_locations.append(peer_location)
 
         # Append myself
-        my_loc = self.getLoc(geodb, config.ip_external)
-        if my_loc:
-            my_loc["ping"] = 0
-            peer_locations.append(my_loc)
+        for ip in self.site.connection_server.ip_external_list:
+            my_loc = self.getLoc(geodb, ip)
+            if my_loc:
+                my_loc["ping"] = 0
+                peer_locations.append(my_loc)
 
         return peer_locations
 
@@ -678,8 +713,22 @@ class UiWebsocketPlugin(object):
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
 
+        if self.site.address == config.updatesite:
+            return self.response(to, "You can't change the ownership of the updater site")
+
         self.site.settings["own"] = bool(owned)
         self.site.updateWebsocket(owned=owned)
+
+    def actionUserSetSitePrivatekey(self, to, privatekey):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        site_data = self.user.sites[self.site.address]
+        site_data["privatekey"] = privatekey
+        self.site.updateWebsocket(set_privatekey=bool(privatekey))
+
+        return "ok"
 
     def actionSiteSetAutodownloadoptional(self, to, owned):
         permissions = self.getPermissions(to)
@@ -689,7 +738,7 @@ class UiWebsocketPlugin(object):
         self.site.settings["autodownloadoptional"] = bool(owned)
         self.site.bad_files = {}
         gevent.spawn(self.site.update, check_files=True)
-        self.site.worker_manager.removeGoodFileTasks()
+        self.site.worker_manager.removeSolvedFileTasks()
 
     def actionDbReload(self, to):
         permissions = self.getPermissions(to)
